@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/ironlock.svg)](https://crates.io/crates/ironlock)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.92%2B-orange.svg)](https://www.rust-lang.org/)
-[![CI](https://github.com/christurgeon/ironlock/actions/workflows/ci.yml/badge.svg)](https://github.com/christurgeon/ironlock/actions/workflows/ci.yml)
+[![CI](https://github.com/christurgeon/ironlock/actions/workflows/ci.yaml/badge.svg)](https://github.com/christurgeon/ironlock/actions/workflows/ci.yaml)
 
 A secure file encryption CLI tool built in Rust. Ironlock uses industry-standard cryptographic primitives to protect your files with a password.
 
@@ -50,7 +50,7 @@ ironlock encrypt document.pdf image.png notes.md
 # Force overwrite of existing .il files
 ironlock encrypt secret.txt --force
 
-# Securely delete originals after encryption (3-pass random overwrite)
+# Best-effort overwrite/delete originals after encryption (see limitations below)
 ironlock encrypt secret.txt --shred
 
 # Combine flags
@@ -68,7 +68,8 @@ Confirm password:
 Encrypting secret.txt ... ✓ → secret.il
 ```
 
-> **Note:** The original file extension is encrypted inside the `.il` file and will be restored on decryption. This hides the file type from observers.
+> **Format note:** New v2 files encrypt the original filename and extension as authenticated metadata. Legacy v1 files still decrypt, but v1 stored the filename in its public header; re-encrypt sensitive v1 files to migrate them.
+> If same-stem inputs would collide (for example `report.txt` and `report.pdf`), Ironlock assigns distinct randomized `.il` names during batch preflight.
 
 ### Decrypt Files
 
@@ -97,9 +98,11 @@ ironlock encrypt ./my-folder/
 # Decrypt all .il files in a directory to an output location
 ironlock decrypt ./my-folder/ -o ./decrypted/
 
-# Encrypt a directory and securely delete the originals
+# Encrypt a directory and best-effort overwrite/delete the originals
 ironlock encrypt ./sensitive-docs/ --shred
 ```
+
+Directory encryption rejects links/reparse points and skips existing `.il` files. All input/output paths are planned before the first file is changed.
 
 ### Piping (Stdin/Stdout)
 
@@ -140,7 +143,7 @@ ironlock d secret.il -o out/ # same as: ironlock decrypt secret.il -o out/
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--force` | `-f` | Overwrite existing `.il` files without prompting |
-| `--shred` | `-s` | Securely delete originals after encryption (also `--delete`) |
+| `--shred` | `-s` | Best-effort 3-pass overwrite and delete (also `--delete`; media-dependent) |
 | `--progress` | `-p` | Show a progress bar when processing multiple files |
 
 #### Decrypt
@@ -157,13 +160,18 @@ Ironlock uses the following cryptographic primitives:
 
 - **Argon2id** for password-based key derivation (64 MiB memory, 3 iterations, 4 parallelism)
 - **ChaCha20-Poly1305** for authenticated encryption (256-bit keys, 96-bit nonces)
-- **Authenticated header** — the file header (magic bytes, version, KDF params, filename, salt, nonce) is passed as AEAD associated data, preventing undetected tampering
-- **Secure memory handling** via `zeroize` (key material zeroed on drop) and `mlock` (prevents swap to disk on Unix)
-- **Secure deletion** via `--shred` overwrites files with cryptographically random data (3 passes) before unlinking
+- **Authenticated streaming** — v2 encrypts independent 64 KiB records with authenticated sequence numbers plus a final authenticated byte/chunk count, detecting tampering, reordering, and truncation
+- **Encrypted metadata** — original filenames/extensions are inside the encrypted metadata record, not the public v2 header
+- **Bounded parsing** — KDF costs, chunk sizes, record lengths, counters, and legacy-file size are checked before allocation/work
+- **Atomic private outputs** — data is written to an owner-only temporary file, synced, and atomically installed; links/reparse points are rejected
+- **Secure memory handling** via `zeroize` for passwords, keys, plaintext chunks, metadata, and legacy plaintext, plus best-effort `mlock` on Unix
+- **Best-effort deletion** — `--shred` overwrites in fixed-size chunks three times before unlinking
 
-KDF parameters are stored in the encrypted file header, allowing future upgrades without breaking existing files.
+KDF parameters remain in the public authenticated header so the key can be derived, but readers enforce strict work-factor limits before running Argon2. v2 uses Argon2id with a fresh salt and derives unique per-record ChaCha20-Poly1305 nonces from a random base nonce and authenticated sequence number.
 
-> **Note:** Ironlock currently loads entire files into memory. A warning is displayed for files over 1 GiB. For very large files, consider available RAM or use stdin piping.
+Version 2 streams file and stdin/stdout operations with bounded memory. Decryption of legacy v1 files remains one-shot and is capped at 256 MiB.
+
+> **Deletion limitation:** `--shred` cannot guarantee media sanitization on SSDs, copy-on-write or journaled filesystems, snapshots, cloud storage, or backups. Prefer full-volume encryption and storage-native sanitize or cryptographic-erase procedures when recovery resistance matters.
 
 ## Development
 

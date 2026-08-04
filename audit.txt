@@ -1,0 +1,458 @@
+REMEDIATION UPDATE — 2026-08-03
+
+All findings A-01 through A-11 below have been addressed in the working tree:
+
+- A-01: batch preflight assigns collision-free outputs; source/output identity is rejected; directory jobs skip existing .il files.
+- A-02: symlinks and Windows reparse points are rejected; recursive traversal is canonicalized and containment-checked.
+- A-03: v2 encrypts filename metadata. v1 remains read-compatible and its historical metadata limitation is documented.
+- A-04: KDF, chunk, record, counter, and legacy-file limits are enforced before allocation/work.
+- A-05/A-06: outputs use private same-directory temporary files, sync, and atomic/no-clobber installation with link revalidation.
+- A-07: incomplete batches now return an error and therefore a non-zero process status.
+- A-08: overwrite/delete is fixed-memory and consistently described as best effort with media-specific limitations.
+- A-09/A-10: v2 uses bounded authenticated streaming and zeroized plaintext/metadata buffers.
+- A-11: CI is consolidated into ci.yaml; the badge targets it, cargo-audit 0.22.2 is pinned, and the final RustSec scan reports no vulnerabilities or warnings.
+
+The original findings are retained below as historical rationale. Their assessment,
+recommendations, validation counts, and limitations describe the pre-remediation
+code and are not a list of open work. Regression tests cover the critical/high-risk
+cases. A fresh independent security review and fuzzing campaign are still
+recommended before a high-assurance release.
+
+
+IRONLOCK APPLICATION AUDIT — ORIGINAL PRE-REMEDIATION REPORT
+Date: 2026-08-03
+Scope: Rust source, CLI behavior, encrypted-file format, filesystem operations,
+tests, documentation, Cargo configuration, and GitHub Actions in this workspace.
+
+ORIGINAL OVERALL ASSESSMENT (PRE-REMEDIATION)
+
+Ironlock has a sound choice of core primitives and unusually good unit-test
+coverage for a small CLI, but it is not yet safe to recommend for valuable data.
+The current implementation has one deterministic data-loss path and several
+high-impact trust-boundary problems involving symlinks, unauthenticated resource
+parameters, metadata disclosure, and output replacement.
+
+Finding count: 1 Critical, 4 High, 5 Medium, 1 Low.
+
+Fix A-01 through A-05 before a production release or before describing the tool
+as secure. Back up any data before testing --force or --shred on the current
+implementation.
+
+
+FINDINGS
+
+A-01 — CRITICAL — Output-name collisions plus --shred can permanently lose data
+
+Locations:
+- src/file_ops.rs:122-142 (output name is only <stem>.il)
+- src/file_ops.rs:169-175 (write output, then shred input)
+- src/file_ops.rs:264-287 (directory collection includes existing .il files)
+
+Every source with the same stem maps to the same destination. For example,
+report.txt and report.pdf both become report.il. With --force --shred, the first
+encrypted result is silently replaced by the second after both originals have
+been destroyed, so one file is unrecoverable.
+
+An input already named report.il maps to itself. The function reads it, writes
+the new ciphertext back to report.il, then secure_delete(report.il) removes the
+new result. It returns success with a path that no longer exists. Directory
+encryption makes this reachable accidentally because it does not exclude .il
+files. Processing order is filesystem-dependent, which can make mixed
+directories fail nondeterministically.
+
+Recommendation:
+- Preflight the entire batch before changing any file. Reject duplicate output
+  paths, source/output identity, and collisions with other inputs.
+- Use an injective or random output naming scheme. If hiding extensions is a
+  requirement, a random identifier is safer than stripping the extension.
+- Exclude .il inputs by default, or produce a genuinely distinct output name.
+- Never shred an input until a distinct, committed output has been verified.
+- Add regression tests for same-stem files, .il input, directory re-encryption,
+  and every combination of --force and --shred.
+
+
+A-02 — HIGH — Recursive traversal follows symlinks outside the requested tree
+
+Locations:
+- src/file_ops.rs:264-287
+- src/main.rs:255-275 and 305-350
+
+collect_files_recursive deliberately uses Path::is_dir/is_file, which follow
+symlinks. A symlinked directory can therefore make encryption write into, and
+--shred overwrite/delete files from, a location outside the directory the user
+selected. A symlink to an ancestor can also create an endless traversal that
+grows the stack/vector until the process exhausts resources. A top-level file
+symlink with --shred overwrites the target's contents before unlinking the
+symlink, which is surprising and destructive.
+
+Recommendation:
+- Use symlink_metadata and skip symlinks/reparse points by default.
+- If following links is offered as an explicit option, canonicalize the root and
+  each entry, enforce descendant containment, and maintain a visited directory
+  identity set (device/inode or platform equivalent) to prevent cycles.
+- Revalidate immediately before each destructive operation; add Unix symlink
+  and Windows junction/reparse-point tests.
+
+
+A-03 — HIGH — Original filenames and extensions are stored in plaintext
+
+Locations:
+- src/crypto.rs:224-247
+- README.md:71
+
+The filename is appended directly to the unencrypted header and used as AEAD
+associated data. Associated data is authenticated, not encrypted. Anyone can
+read the exact original filename and extension without the password. This
+directly contradicts the README statement that the extension is encrypted and
+the file type is hidden from observers. Filenames commonly contain sensitive
+case names, client names, medical terms, or project identifiers.
+
+Recommendation:
+- Move filename metadata inside the encrypted payload and keep only non-secret,
+  bounded format/KDF fields in the public header.
+- Introduce a new format version and retain a carefully tested v1 reader if
+  backward compatibility is required.
+- Correct the documentation immediately for existing v1 files.
+
+
+A-04 — HIGH — Hostile files control Argon2 memory and CPU costs before authentication
+
+Locations:
+- src/crypto.rs:277-297 (reads u32 parameters from the file)
+- src/crypto.rs:331-334 (derives the key before AEAD verifies the header)
+- src/crypto.rs:66-84 (passes values directly to Argon2)
+
+An arbitrary 67-byte, valid-looking .il file can request attacker-chosen Argon2
+memory, iteration, and parallelism values. The locked argon2 0.5.3 implementation
+accepts memory and iteration costs up to u32::MAX and allocates a vector sized
+from the memory cost. A malicious header can therefore request roughly 4 TiB of
+memory or billions of iterations before authentication fails, causing process
+abort, severe swapping, or prolonged CPU exhaustion.
+
+The fact that these fields are later covered by AAD does not help: their values
+are needed before the authentication tag can be checked.
+
+Recommendation:
+- Enforce conservative maximums before constructing Params (and sensible
+  minimums to prevent weak new profiles).
+- Prefer a small allowlist of versioned KDF profiles rather than arbitrary u32
+  values. Reject unsupported profiles cheaply.
+- Add hostile-header tests for maximum memory, iterations, parallelism, and
+  invalid combinations; tests must prove rejection occurs before allocation.
+
+
+A-05 — HIGH — Output replacement is neither atomic nor link-safe
+
+Locations:
+- src/file_ops.rs:31-46 (separate existence/prompt check)
+- src/file_ops.rs:169-170 and 254-258 (fs::write directly to final path)
+
+fs::write creates or truncates the final destination in place. A crash, disk-full
+condition, or short/failed write can leave an existing encrypted or plaintext
+file corrupted. This is particularly dangerous with --force. The check and the
+write are also separate operations, and fs::write follows symlinks. In a shared
+directory, another process can replace the checked path with a symlink and cause
+Ironlock to overwrite a different file writable by the victim.
+
+Recommendation:
+- Create a restrictive, unpredictable temporary file in the destination
+  directory with create_new/no-follow semantics.
+- Write completely, flush/sync, then atomically rename/replace the final path;
+  sync the parent directory where supported.
+- Treat overwrite consent as applying to the exact validated destination, and
+  prevent link/reparse-point traversal at commit time.
+- Only shred the source after the atomic commit succeeds.
+
+
+A-06 — MEDIUM — Newly decrypted plaintext may be created with broad permissions
+
+Location: src/file_ops.rs:239-258
+
+fs::write uses platform defaults. On Unix, a typical umask of 022 can yield mode
+0644, exposing decrypted plaintext to other local users. On Windows, the file
+inherits directory ACLs, which may also be broader than intended.
+
+Recommendation:
+- Create new plaintext outputs with owner-only access (0600 on Unix) and a
+  deliberate restrictive ACL policy on Windows.
+- Preserve or deliberately set permissions only after authenticated metadata is
+  available; test the resulting permissions on each supported platform.
+
+
+A-07 — MEDIUM — Batch failures still produce process exit status 0
+
+Locations:
+- src/main.rs:157-223 (errors are only counted)
+- src/main.rs:255-277 and 305-357 (run returns Ok after per-file failures)
+
+Wrong passwords, I/O errors, invalid files, and skipped overwrites are printed,
+but the command still returns success after processing the batch. Scripts and
+backup jobs cannot reliably detect incomplete encryption/decryption.
+
+Recommendation:
+- Return a non-zero exit code when any item fails; decide and document whether a
+  user cancellation is failure or a separate status.
+- Keep processing remaining files if desired, but return a structured batch
+  error at the end. Add end-to-end exit-code tests.
+
+
+A-08 — MEDIUM — “Secure deletion” is overclaimed and memory-hungry
+
+Locations:
+- src/file_ops.rs:49-94
+- README.md:84, 100, and 162
+
+Three overwrites of a filesystem path cannot guarantee sanitization on SSDs,
+flash translation layers, copy-on-write filesystems, snapshots, journaled data,
+cloud storage, or backups. The implementation also allocates a buffer equal to
+the complete file size, so shredding a large or sparse file can exhaust memory.
+On 32-bit targets, converting u64 file length to usize can truncate the length.
+
+Current NIST guidance treats sanitization as media-specific and points to
+approved standards or cryptographic erase rather than presenting three generic
+file overwrites as a universal guarantee:
+https://csrc.nist.gov/pubs/sp/800/88/r2/final
+
+Recommendation:
+- Rename this behavior to best-effort overwrite/delete and document its limits.
+- Overwrite in fixed-size chunks with checked length conversions if retaining it.
+- Recommend full-volume encryption, storage-native sanitize/secure-erase, or
+  cryptographic erase for actual media sanitization.
+
+
+A-09 — MEDIUM — Piping is not streaming and does not mitigate large-file memory use
+
+Locations:
+- src/main.rs:61-76
+- src/file_ops.rs:144-170 and 201-258
+- README.md:166
+
+Both stdin paths call read_to_end, while file paths call fs::read; AEAD then
+allocates another full output buffer. Peak memory is therefore around two full
+copies plus KDF memory. The README specifically advises stdin piping for very
+large files, but piping uses the same whole-input strategy and offers no memory
+relief. Unbounded stdin or a large encrypted file can terminate the process.
+
+Recommendation:
+- Remove the misleading piping advice until real streaming exists.
+- Define a versioned chunked format with independent authenticated chunks,
+  deterministic nonce derivation/counters, ordering protection, and a final
+  authenticated length/terminator so truncation and reordering are detected.
+- Apply explicit input/chunk/metadata limits and test truncation behavior.
+
+
+A-10 — MEDIUM — Plaintext buffers are not zeroized
+
+Locations:
+- src/main.rs:63-75
+- src/file_ops.rs:157-170 and 214-258
+
+Passwords and the primary derived-key array use Zeroizing, but plaintext and
+decrypted data use ordinary Vec<u8> values. Their contents can remain in freed
+heap pages and may appear in process dumps or later memory disclosure. The
+whole-file design increases the amount and lifetime of exposed plaintext.
+
+Recommendation:
+- Wrap sensitive buffers in Zeroizing where practical and disable/limit core
+  dumps for a hardened mode.
+- Prefer chunked processing so only a small plaintext window exists at a time.
+- Review copies held by cipher/KDF types and ensure all secret-bearing temporary
+  values are zeroized, not only the returned key.
+
+
+A-11 — LOW — Duplicate CI workflows can give a misleading green badge
+
+Locations:
+- .github/workflows/ci.yml
+- .github/workflows/ci.yaml
+- README.md:6
+
+Two workflows share the display name “CI.” The README badge targets ci.yml,
+which has no cargo-audit job, while the separate ci.yaml workflow performs the
+security scan. The badge can therefore be green even if the security workflow
+fails, and all tests/lints are needlessly duplicated.
+
+Recommendation:
+- Consolidate into one workflow, keep the cross-platform test matrix and
+  cargo-audit job, and point the badge at that workflow.
+- Pin the cargo-audit version or use a maintained action/cache so CI behavior is
+  reproducible.
+
+
+POSITIVE OBSERVATIONS
+
+- ChaCha20-Poly1305 is used as AEAD, and the public header is bound as associated
+  data, so v1 header/ciphertext tampering is detected after key derivation.
+- New encryptions use OsRng-generated 128-bit salts and 96-bit nonces.
+- The default Argon2id profile (64 MiB, 3 iterations, parallelism 4) is explicit
+  and stored for format evolution.
+- Password strings and the primary key array use Zeroizing; password input is
+  hidden and encryption requires confirmation.
+- Recovered filenames are reduced to a final path component before output,
+  covering straightforward embedded-filename path traversal.
+- The test suite is broad for crypto round-trips, corrupt data, wrong passwords,
+  CLI parsing, directory structure, and common filesystem errors.
+- Tests, rustfmt, and clippy all passed during this audit.
+
+
+VALIDATION PERFORMED
+
+- cargo test --all-targets: PASS (124 passed, 0 failed)
+- cargo fmt -- --check: PASS
+- cargo clippy --all-targets -- -D warnings: PASS
+- Manual review of all non-test application code and relevant tests/docs/CI
+- Confirmed from the locally locked argon2 0.5.3 source that MAX_M_COST and
+  MAX_T_COST are u32::MAX and hash_password_into allocates by block_count
+
+LIMITATIONS
+
+- This was a source-level audit, not a formal cryptographic proof, fuzzing
+  campaign, penetration test, or recovery test on physical SSD/COW media.
+- cargo-audit was not installed locally, so its dependency advisory scan was not
+  independently rerun. The ci.yaml workflow is configured to run cargo audit.
+- Unix symlink behavior was reviewed from code but not executed on this Windows
+  host. Windows junction/reparse-point behavior also needs dedicated tests.
+
+
+ORIGINAL SUGGESTED FIX ORDER — COMPLETED
+
+1. A-01: preflight collisions/self-output and make --shred safe.
+2. A-02: stop following symlinks and prevent traversal cycles/scope escape.
+3. A-03: redesign the v2 format so filenames are encrypted.
+4. A-04: bound/allowlist KDF parameters before allocating work.
+5. A-05 and A-06: implement atomic, no-follow, restrictive output creation.
+6. A-07: correct batch exit semantics.
+7. A-08 through A-10: narrow deletion claims and implement bounded streaming.
+8. Add regression/fuzz tests, consolidate CI, and run cargo audit continuously.
+
+
+FINAL REMEDIATION RECORD — 2026-08-03
+
+This section records the implemented fixes. It supersedes the original assessment,
+recommendations, validation results, and suggested fix order above.
+
+A-01 — FIXED — Output collisions and --shred data loss
+
+- src/secure_fs.rs now preflights the complete encryption batch before prompting
+  for a password or modifying files.
+- Source identities, hard-linked duplicates, duplicate inputs, source/output
+  identity, and output collisions are rejected before processing.
+- Files with the same stem receive distinct randomized .il output names instead
+  of overwriting one another.
+- Directory encryption skips existing .il files by default.
+- The source is shredded only after a distinct encrypted output has been fully
+  written, synchronized, and committed.
+- Regression tests cover same-stem files with shredding, .il inputs, duplicate
+  preflight rejection, and preservation of both encrypted results.
+
+A-02 — FIXED — Symlink/reparse-point traversal and scope escape
+
+- Recursive collection rejects symbolic links and Windows reparse points.
+- The traversal root and entries are canonicalized and checked for containment.
+- Open source files are revalidated using stable file identity and no-follow/open-
+  reparse-point platform flags before data is processed.
+- Destructive deletion acts on the validated source identity rather than silently
+  following a substituted link.
+- Unix regression tests cover link traversal and linked-output rejection; the
+  Windows reparse-point protection is compiled and exercised by Windows file tests.
+
+A-03 — FIXED — Cleartext filename metadata
+
+- New files use format version 2 in src/stream_crypto.rs.
+- The public header contains only format/KDF/stream parameters, salt, and nonce.
+- The original filename is stored inside an authenticated encrypted metadata
+  record and no longer appears in cleartext ciphertext.
+- Version 1 files remain decryptable for migration. Their historical cleartext
+  filename limitation cannot be retroactively removed without re-encryption.
+- Older Ironlock releases cannot decrypt newly created v2 files.
+
+A-04 — FIXED — Attacker-controlled KDF/resource exhaustion
+
+- KDF memory, iteration, and parallelism values are validated before constructing
+  Argon2 parameters or allocating work.
+- Current accepted limits are at most 128 MiB of Argon2 memory, 6 iterations, and
+  parallelism 8, with valid minimums and memory/parallelism relationships enforced.
+- Stream record lengths, metadata sizes, chunk sizes, counters, and legacy input
+  size are bounded before allocation. Legacy v1 input is capped at 256 MiB.
+- Tests verify hostile KDF and oversized record rejection.
+
+A-05 — FIXED — Non-atomic and link-following output replacement
+
+- Outputs are first written to unpredictable private temporary files in the final
+  destination directory.
+- Data is flushed and synchronized before installation.
+- No-clobber installation uses platform atomic primitives where available;
+  intentional --force replacement is also performed atomically.
+- Destination and parent components are checked for links/reparse points and are
+  revalidated before commit.
+- Failed decryption leaves an existing destination untouched and removes the
+  temporary file.
+
+A-06 — FIXED — Plaintext output permissions
+
+- Temporary and final outputs are created private: mode 0600 on Unix and a Windows
+  DACL limited to SYSTEM and the current owner.
+- Plaintext is never first exposed through a permissively created destination.
+- Permission behavior has regression coverage on Unix; Windows output creation is
+  exercised by the Windows round-trip suite.
+
+A-07 — FIXED — Partial batch failures reported success
+
+- Batch counters now return IronlockError::BatchIncomplete whenever any item
+  failed or was skipped.
+- main propagates that error, producing a non-zero process exit status.
+- A regression test verifies incomplete batches cannot return success.
+
+A-08 — FIXED WITH DOCUMENTED PLATFORM LIMITATION — Secure-deletion claims/memory
+
+- secure_delete uses a fixed 1 MiB zeroizing random buffer for three overwrite
+  passes instead of allocating a buffer the size of the file.
+- Before overwriting, the validated source is quarantined under an unpredictable
+  same-directory name; failures attempt to restore it.
+- CLI help and README now consistently call shredding best effort and document
+  that SSD wear-leveling, copy-on-write filesystems, snapshots, backups, and caches
+  can retain copies. No software-only overwrite can guarantee physical erasure on
+  those storage systems.
+
+A-09 — FIXED — Whole-input stdin/file processing
+
+- Version 2 encrypts and decrypts bounded 64 KiB authenticated records.
+- stdin/stdout and regular-file paths use the streaming implementation rather than
+  read_to_end/fs::read for new-format data.
+- Each record binds its type, sequence number, and length as associated data.
+- A final encrypted record authenticates total plaintext length and chunk count,
+  detecting truncation, reordering, duplication, and trailing data.
+- Tests cover multi-chunk round trips, truncation, trailing data, and excessive
+  record lengths.
+
+A-10 — FIXED — Plaintext buffer zeroization
+
+- Streaming plaintext, decrypted metadata, keys, passwords, and legacy plaintext
+  buffers use zeroizing storage where practical.
+- The v2 design limits live plaintext to a bounded chunk instead of retaining the
+  complete file in memory.
+
+A-11 — FIXED — Duplicate/misleading CI
+
+- The duplicate .github/workflows/ci.yml was removed.
+- .github/workflows/ci.yaml is the single workflow and the README badge targets it.
+- CI runs locked cross-platform tests, strict Clippy, and cargo-audit 0.22.2.
+- indicatif was upgraded to remove the unmaintained number_prefix dependency,
+  stale lockfile dependencies were removed, and rand resolved to 0.8.7.
+
+FINAL VALIDATION
+
+- cargo test --all-targets --locked: PASS (96 passed, 0 failed)
+- cargo fmt --all -- --check: PASS
+- cargo clippy --all-targets --locked -- -D warnings: PASS
+- cargo build --release --locked: PASS
+- cargo-audit 0.22.2: PASS (101 locked dependencies scanned; no vulnerabilities
+  or warnings reported)
+
+REMAINING ASSURANCE LIMITS (NOT UNFIXED FINDINGS)
+
+- This remediation is not a formal cryptographic proof, independent penetration
+  test, or fuzzing campaign.
+- Best-effort shredding cannot guarantee erasure from SSD flash translation layers,
+  copy-on-write storage, snapshots, backups, swap, caches, or prior copies.
+- Re-encrypt legacy v1 files to v2 if filename confidentiality is required.

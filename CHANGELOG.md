@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Security
+
+- Added encrypted-file format v2 with encrypted filename metadata and bounded, independently authenticated streaming records
+- Added strict pre-allocation limits for KDF work factors, chunk sizes, record lengths, counters, and legacy files
+- Added collision-safe batch preflight, symlink/reparse-point rejection, private atomic output files, and file-identity revalidation
+- Changed `--shred` to fixed-memory best-effort overwrite/delete behavior and documented storage-media limitations
+- Preserved read compatibility with v1 encrypted files
+
+### Changed
+
+- Batch commands now return a non-zero exit status when any file fails or is skipped
+- Directory encryption skips existing `.il` files and rejects links instead of following them
+- stdin/stdout and regular v2 file operations now use bounded streaming
 
 ## [0.1.0] - 2026-03-20
 

@@ -26,6 +26,7 @@ clap = { version = "4.4", features = ["derive"] }
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 rand = "0.8"
+same-file = "1.0"
 
 # Secure password input
 rpassword = "7.3"
@@ -40,10 +41,17 @@ zeroize = { version = "1.7", features = ["derive"] }
 colored = "2.1"
 
 # Progress bars
-indicatif = "0.17"
+indicatif = "0.18.6"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+] }
 
 [dev-dependencies]
 tempfile = "3.10"

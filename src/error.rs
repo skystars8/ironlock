@@ -32,6 +32,18 @@ pub enum IronlockError {
     #[error("Not a directory: {0}")]
     NotADirectory(String),
 
+    #[error("Unsafe path: {0}")]
+    UnsafePath(String),
+
+    #[error("Output collision: {0}")]
+    OutputCollision(String),
+
+    #[error("Resource limit exceeded: {0}")]
+    ResourceLimit(String),
+
+    #[error("Batch incomplete: {failed} failed, {skipped} skipped")]
+    BatchIncomplete { failed: usize, skipped: usize },
+
     #[error("Operation cancelled by user")]
     Cancelled,
 }

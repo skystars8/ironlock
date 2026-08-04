@@ -31,7 +31,8 @@ pub enum Commands {
         #[arg(short, long, default_value_t = false)]
         force: bool,
 
-        /// Securely delete original files after encryption (overwrites with random data)
+        /// Best-effort overwrite/delete originals after encryption.
+        /// This is not guaranteed media sanitization on SSDs, snapshots, or CoW storage.
         #[arg(short = 's', long, visible_alias = "delete", default_value_t = false)]
         shred: bool,
 

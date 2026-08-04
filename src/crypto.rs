@@ -34,6 +34,17 @@ const ARGON2_MEMORY_KIB: u32 = 65536; // 64 MiB
 const ARGON2_ITERATIONS: u32 = 3;
 const ARGON2_PARALLELISM: u32 = 4;
 
+/// Hard limits applied before allocating Argon2 work memory. File headers are
+/// attacker-controlled until AEAD authentication succeeds, so accepting the
+/// crate's u32::MAX limits would permit enormous allocations or CPU work.
+pub const MAX_ARGON2_MEMORY_KIB: u32 = 128 * 1024;
+pub const MAX_ARGON2_ITERATIONS: u32 = 6;
+pub const MAX_ARGON2_PARALLELISM: u32 = 8;
+
+pub const MIN_ARGON2_MEMORY_KIB: u32 = 8;
+pub const MIN_ARGON2_ITERATIONS: u32 = 1;
+pub const MIN_ARGON2_PARALLELISM: u32 = 1;
+
 /// Argon2id key derivation parameters stored in the file header
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct KdfParams {
@@ -53,6 +64,32 @@ impl KdfParams {
     }
 }
 
+/// Rejects unreasonable KDF work factors before the Argon2 crate can allocate.
+pub fn validate_kdf_params(kdf_params: &KdfParams) -> Result<()> {
+    if !(MIN_ARGON2_MEMORY_KIB..=MAX_ARGON2_MEMORY_KIB).contains(&kdf_params.memory_kib) {
+        return Err(IronlockError::ResourceLimit(format!(
+            "Argon2 memory cost must be between {} and {} KiB",
+            MIN_ARGON2_MEMORY_KIB, MAX_ARGON2_MEMORY_KIB
+        )));
+    }
+    if !(MIN_ARGON2_ITERATIONS..=MAX_ARGON2_ITERATIONS).contains(&kdf_params.iterations) {
+        return Err(IronlockError::ResourceLimit(format!(
+            "Argon2 iterations must be between {} and {}",
+            MIN_ARGON2_ITERATIONS, MAX_ARGON2_ITERATIONS
+        )));
+    }
+    if !(MIN_ARGON2_PARALLELISM..=MAX_ARGON2_PARALLELISM).contains(&kdf_params.parallelism) {
+        return Err(IronlockError::ResourceLimit(format!(
+            "Argon2 parallelism must be between {} and {}",
+            MIN_ARGON2_PARALLELISM, MAX_ARGON2_PARALLELISM
+        )));
+    }
+    if kdf_params.memory_kib < kdf_params.parallelism * 8 {
+        return Err(IronlockError::InvalidFileFormat);
+    }
+    Ok(())
+}
+
 /// Derives a 256-bit encryption key from a password using Argon2id
 ///
 /// Argon2id is the recommended password hashing algorithm, combining:
@@ -68,6 +105,8 @@ pub fn derive_key_from_password(
     salt: &[u8],
     kdf_params: &KdfParams,
 ) -> Result<Zeroizing<[u8; KEY_LENGTH]>> {
+    validate_kdf_params(kdf_params)?;
+
     let params = Params::new(
         kdf_params.memory_kib,
         kdf_params.iterations,
@@ -189,6 +228,7 @@ pub fn decrypt(
 // during decryption.
 
 /// Creates the encrypted file format with all metadata using default KDF params
+#[cfg(test)]
 pub fn create_encrypted_file(
     password: &[u8],
     original_filename: &str,
@@ -203,6 +243,7 @@ pub fn create_encrypted_file(
 }
 
 /// Creates the encrypted file format with all metadata using the specified KDF params
+#[cfg(test)]
 pub fn create_encrypted_file_with_params(
     password: &[u8],
     original_filename: &str,

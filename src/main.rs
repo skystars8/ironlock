@@ -3,9 +3,11 @@ mod crypto;
 mod error;
 mod file_ops;
 mod memlock;
+mod secure_fs;
+mod stream_crypto;
 
-use std::io::{self, IsTerminal, Read, Write};
-use std::path::{Path, PathBuf};
+use std::io::{self, IsTerminal, Write};
+use std::path::PathBuf;
 
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -13,71 +15,64 @@ use zeroize::Zeroizing;
 
 use cli::{Cli, Commands};
 use error::{IronlockError, Result};
-use file_ops::{collect_files_recursive, decrypt_file_to_path, encrypt_file, IRONLOCK_EXTENSION};
+use file_ops::{
+    decrypt_file_to_path, encrypt_file_to_path, plan_decryption_inputs, plan_encryption_inputs,
+};
 use memlock::mlock_slice;
+use stream_crypto::{encrypt_stream, StreamDecryptor};
 
-/// Prompt for password input (hidden from terminal)
 fn prompt_password(prompt: &str) -> Result<Zeroizing<String>> {
-    eprint!("{}", prompt);
+    eprint!("{prompt}");
     io::stderr().flush()?;
 
-    let password =
-        rpassword::read_password().map_err(|e| IronlockError::IoError(io::Error::other(e)))?;
-
-    // Best-effort mlock to prevent the password from being swapped to disk.
+    let password = rpassword::read_password()
+        .map_err(|error| IronlockError::IoError(io::Error::other(error)))?;
     mlock_slice(password.as_bytes());
-
     Ok(Zeroizing::new(password))
 }
 
-/// Prompt for password with confirmation (for encryption)
 fn prompt_password_with_confirm() -> Result<Zeroizing<String>> {
     let password = prompt_password("Enter password: ")?;
-
     if password.is_empty() {
         return Err(IronlockError::EmptyPassword);
     }
 
     let confirm = prompt_password("Confirm password: ")?;
-
     if *password != *confirm {
         return Err(IronlockError::PasswordMismatch);
     }
-
     Ok(password)
 }
 
-/// Prompt for password (for decryption - no confirmation needed)
 fn prompt_password_decrypt() -> Result<Zeroizing<String>> {
     let password = prompt_password("Enter password: ")?;
-
     if password.is_empty() {
         return Err(IronlockError::EmptyPassword);
     }
-
     Ok(password)
 }
 
-/// Encrypt data read from stdin and write the encrypted blob to stdout
 fn encrypt_stdin(password: &[u8]) -> Result<()> {
-    let mut data = Vec::new();
-    io::stdin().read_to_end(&mut data)?;
-    let encrypted = crypto::create_encrypted_file(password, "stdin", &data)?;
-    io::stdout().write_all(&encrypted)?;
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut reader = stdin.lock();
+    let mut writer = stdout.lock();
+    encrypt_stream(password, "stdin", &mut reader, &mut writer)?;
+    writer.flush()?;
     Ok(())
 }
 
-/// Decrypt data read from stdin and write the plaintext to stdout
 fn decrypt_stdin(password: &[u8]) -> Result<()> {
-    let mut data = Vec::new();
-    io::stdin().read_to_end(&mut data)?;
-    let (_filename, plaintext) = crypto::decrypt_file(password, &data)?;
-    io::stdout().write_all(&plaintext)?;
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let reader = stdin.lock();
+    let mut writer = stdout.lock();
+    let decryptor = StreamDecryptor::new(reader, password)?;
+    decryptor.decrypt_to(&mut writer)?;
+    writer.flush()?;
     Ok(())
 }
 
-/// Checks that stdin is piped (not a terminal) when no files are provided.
-/// Exits with an error message if stdin is a terminal.
 fn require_piped_stdin() {
     if io::stdin().is_terminal() {
         eprintln!(
@@ -88,137 +83,98 @@ fn require_piped_stdin() {
     }
 }
 
-/// Count total files for progress bar (expanding directories)
-fn count_files(files: &[PathBuf], filter_lb: bool) -> u64 {
-    let mut count: u64 = 0;
-    for path in files {
-        if path.is_dir() {
-            if let Ok(dir_files) = collect_files_recursive(path) {
-                if filter_lb {
-                    count += dir_files
-                        .iter()
-                        .filter(|f| {
-                            f.extension().and_then(|e| e.to_str()) == Some(IRONLOCK_EXTENSION)
-                        })
-                        .count() as u64;
-                } else {
-                    count += dir_files.len() as u64;
-                }
-            } else {
-                count += 1; // will error during processing
-            }
-        } else {
-            count += 1;
-        }
-    }
-    count
-}
-
-/// Creates a styled progress bar
 fn make_progress_bar(total: u64) -> ProgressBar {
-    let pb = ProgressBar::new(total);
-    pb.set_style(
+    let progress = ProgressBar::new(total);
+    progress.set_style(
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
-            .unwrap()
+            .expect("progress template is valid")
             .progress_chars("=> "),
     );
-    pb
+    progress
 }
 
-/// Tracks per-file operation results and optionally displays a progress bar
 struct Counters {
     success: usize,
     errors: usize,
     skipped: usize,
-    pb: Option<ProgressBar>,
+    progress: Option<ProgressBar>,
 }
 
 impl Counters {
-    fn new(pb: Option<ProgressBar>) -> Self {
+    fn new(progress: Option<ProgressBar>) -> Self {
         Self {
             success: 0,
             errors: 0,
             skipped: 0,
-            pb,
+            progress,
         }
     }
 
-    /// Output a line — through the progress bar if active, otherwise println
-    fn output(&self, msg: &str) {
-        match &self.pb {
-            Some(pb) => pb.println(msg),
-            None => println!("{}", msg),
+    fn output(&self, message: &str) {
+        match &self.progress {
+            Some(progress) => progress.println(message),
+            None => println!("{message}"),
         }
     }
 
-    /// Handle a single operation result, printing the outcome.
-    /// `prefix` is the "Encrypting foo ... " text.
     fn handle_result(
         &mut self,
         prefix: &str,
         result: std::result::Result<PathBuf, IronlockError>,
-        shred: bool,
+        shredded: bool,
     ) {
         let suffix = match &result {
-            Ok(output_path) => {
-                if shred {
-                    format!(
-                        "{} → {} (original securely deleted)",
-                        "✓".green(),
-                        output_path.display()
-                    )
-                } else {
-                    format!("{} → {}", "✓".green(), output_path.display())
-                }
-            }
-            Err(IronlockError::Cancelled) => format!("{}", "skipped".yellow()),
+            Ok(output_path) if shredded => format!(
+                "{} ? {} (original overwritten/deleted; media-dependent)",
+                "?".green(),
+                output_path.display()
+            ),
+            Ok(output_path) => format!("{} ? {}", "?".green(), output_path.display()),
+            Err(IronlockError::Cancelled) => "skipped".yellow().to_string(),
             Err(IronlockError::DecryptionFailed) => {
-                format!("{} incorrect password or corrupted file", "✗".red())
+                format!("{} incorrect password or corrupted file", "?".red())
             }
-            Err(e) => format!("{} {}", "✗".red(), e),
+            Err(error) => format!("{} {error}", "?".red()),
         };
+        self.output(&format!("{prefix}{suffix}"));
 
-        self.output(&format!("{}{}", prefix, suffix));
-
-        match &result {
+        match result {
             Ok(_) => self.success += 1,
             Err(IronlockError::Cancelled) => self.skipped += 1,
             Err(_) => self.errors += 1,
         }
-
-        if let Some(ref pb) = self.pb {
-            pb.inc(1);
+        if let Some(progress) = &self.progress {
+            progress.inc(1);
         }
     }
 
-    /// Handle a directory-level error
-    fn handle_dir_error(&mut self, e: IronlockError) {
-        self.output(&format!("{} {}", "✗".red(), e));
-        self.errors += 1;
-    }
-
-    /// Print the final summary line
-    fn print_summary(&self, operation: &str) {
-        if let Some(ref pb) = self.pb {
-            pb.finish_and_clear();
+    fn print_summary(&self, operation: &str) -> Result<()> {
+        if let Some(progress) = &self.progress {
+            progress.finish_and_clear();
         }
         println!();
+
         if self.errors == 0 && self.skipped == 0 {
             println!(
                 "{} {} file(s) {} successfully",
-                "✓".green(),
+                "?".green(),
                 self.success,
-                operation,
+                operation
             );
+            Ok(())
         } else {
             println!(
                 "{} {} succeeded, {} failed, {} skipped",
-                "⚠".yellow(),
+                "?".yellow(),
                 self.success,
                 self.errors,
                 self.skipped
             );
+            Err(IronlockError::BatchIncomplete {
+                failed: self.errors,
+                skipped: self.skipped,
+            })
         }
     }
 }
@@ -239,42 +195,28 @@ fn run() -> Result<()> {
                 eprintln!();
                 encrypt_stdin(password.as_bytes())?;
             } else {
-                println!("{}", "🔐 Ironlock Encryption".cyan().bold());
-                println!();
+                // Resolve every input and output before the first modification.
+                let plans = plan_encryption_inputs(&files)?;
 
+                println!("{}", "?? Ironlock Encryption".cyan().bold());
+                println!();
                 let password = prompt_password_with_confirm()?;
                 println!();
 
-                let pb = if progress {
-                    Some(make_progress_bar(count_files(&files, false)))
-                } else {
-                    None
-                };
-                let mut counters = Counters::new(pb);
-
-                for file_path in &files {
-                    if file_path.is_dir() {
-                        counters
-                            .output(&format!("Encrypting directory {} ...", file_path.display()));
-                        match collect_files_recursive(file_path) {
-                            Ok(dir_files) => {
-                                for source in dir_files {
-                                    let prefix = format!("  Encrypting {} ... ", source.display());
-                                    let result =
-                                        encrypt_file(&source, password.as_bytes(), force, shred);
-                                    counters.handle_result(&prefix, result, shred);
-                                }
-                            }
-                            Err(e) => counters.handle_dir_error(e),
-                        }
-                    } else {
-                        let prefix = format!("Encrypting {} ... ", file_path.display());
-                        let result = encrypt_file(file_path, password.as_bytes(), force, shred);
-                        counters.handle_result(&prefix, result, shred);
-                    }
+                let progress = progress.then(|| make_progress_bar(plans.len() as u64));
+                let mut counters = Counters::new(progress);
+                for plan in plans {
+                    let prefix = format!("Encrypting {} ... ", plan.source.display());
+                    let result = encrypt_file_to_path(
+                        &plan.source,
+                        &plan.output,
+                        password.as_bytes(),
+                        force,
+                        shred,
+                    );
+                    counters.handle_result(&prefix, result, shred);
                 }
-
-                counters.print_summary("encrypted");
+                counters.print_summary("encrypted")?;
             }
         }
         Commands::Decrypt {
@@ -289,77 +231,58 @@ fn run() -> Result<()> {
                 eprintln!();
                 decrypt_stdin(password.as_bytes())?;
             } else {
-                println!("{}", "🔓 Ironlock Decryption".cyan().bold());
-                println!();
+                // Traversal and output-directory structure are validated up front.
+                let plans = plan_decryption_inputs(&files, output.as_deref())?;
 
+                println!("{}", "?? Ironlock Decryption".cyan().bold());
+                println!();
                 let password = prompt_password_decrypt()?;
                 println!();
 
-                let pb = if progress {
-                    Some(make_progress_bar(count_files(&files, true)))
-                } else {
-                    None
-                };
-                let mut counters = Counters::new(pb);
-
-                for file_path in &files {
-                    if file_path.is_dir() {
-                        counters
-                            .output(&format!("Decrypting directory {} ...", file_path.display()));
-                        match collect_files_recursive(file_path) {
-                            Ok(dir_files) => {
-                                for source in dir_files {
-                                    if source.extension().and_then(|e| e.to_str())
-                                        != Some(IRONLOCK_EXTENSION)
-                                    {
-                                        continue;
-                                    }
-                                    // Compute output dir preserving directory structure
-                                    let relative =
-                                        source.strip_prefix(file_path).unwrap_or(&source);
-                                    let target_dir = match &output {
-                                        Some(base) => {
-                                            base.join(relative.parent().unwrap_or(Path::new("")))
-                                        }
-                                        None => {
-                                            source.parent().unwrap_or(Path::new("")).to_path_buf()
-                                        }
-                                    };
-                                    let prefix = format!("  Decrypting {} ... ", source.display());
-                                    let result = decrypt_file_to_path(
-                                        &source,
-                                        password.as_bytes(),
-                                        Some(&target_dir),
-                                        force,
-                                    );
-                                    counters.handle_result(&prefix, result, false);
-                                }
-                            }
-                            Err(e) => counters.handle_dir_error(e),
-                        }
-                    } else {
-                        let prefix = format!("Decrypting {} ... ", file_path.display());
-                        let result = decrypt_file_to_path(
-                            file_path,
-                            password.as_bytes(),
-                            output.as_deref(),
-                            force,
-                        );
-                        counters.handle_result(&prefix, result, false);
-                    }
+                let progress = progress.then(|| make_progress_bar(plans.len() as u64));
+                let mut counters = Counters::new(progress);
+                for plan in plans {
+                    let prefix = format!("Decrypting {} ... ", plan.source.display());
+                    let result = decrypt_file_to_path(
+                        &plan.source,
+                        password.as_bytes(),
+                        Some(&plan.target_dir),
+                        force,
+                    );
+                    counters.handle_result(&prefix, result, false);
                 }
-
-                counters.print_summary("decrypted");
+                counters.print_summary("decrypted")?;
             }
         }
     }
-
     Ok(())
 }
 
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("{} {}", "Error".red().bold(), e);
+    if let Err(error) = run() {
+        eprintln!("{} {error}", "Error".red().bold());
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_batch_returns_an_error_exit_condition() {
+        let counters = Counters {
+            success: 1,
+            errors: 1,
+            skipped: 0,
+            progress: None,
+        };
+        assert!(matches!(
+            counters.print_summary("processed"),
+            Err(IronlockError::BatchIncomplete {
+                failed: 1,
+                skipped: 0
+            })
+        ));
     }
 }
