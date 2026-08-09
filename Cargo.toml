@@ -1,6 +1,6 @@
 [package]
 name = "ironlock"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.92"
 description = "A secure file encryption CLI tool using Argon2id and ChaCha20-Poly1305"
@@ -12,7 +12,13 @@ repository = "https://github.com/christurgeon/ironlock"
 homepage = "https://github.com/christurgeon/ironlock"
 documentation = "https://github.com/christurgeon/ironlock#readme"
 authors = ["Chris Turgeon <turgeonchris3@outlook.com>"]
-exclude = [".github/", "tests/", "*.il", "CLAUDE.md"]
+exclude = [
+    ".github/",
+    "*.il",
+    "*.bat",
+    "CLAUDE.md",
+    "audit.txt",
+]
 
 [[bin]]
 name = "ironlock"
@@ -62,3 +68,4 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+overflow-checks = true

@@ -8,8 +8,8 @@ Thank you for your interest in contributing to Ironlock! This document provides 
 2. Clone your fork: `git clone https://github.com/YOUR_USERNAME/ironlock.git`
 3. Create a branch: `git checkout -b my-feature`
 4. Make your changes
-5. Run tests: `cargo test`
-6. Run lints: `cargo clippy && cargo fmt --check`
+5. Run tests: `cargo test --all-targets --locked`
+6. Run the formatting and strict lint gates shown below
 7. Commit your changes
 8. Push and create a Pull Request
 
@@ -26,13 +26,13 @@ Thank you for your interest in contributing to Ironlock! This document provides 
 
 ```bash
 # Debug build
-cargo build
+cargo build --locked
 
 # Release build
-cargo build --release
+cargo build --release --locked
 
 # Run tests
-cargo test
+cargo test --all-targets --locked
 
 # Run with verbose output
 RUST_BACKTRACE=1 cargo run -- encrypt test.txt
@@ -40,8 +40,9 @@ RUST_BACKTRACE=1 cargo run -- encrypt test.txt
 
 ### Code Style
 
-- Run `cargo fmt` before committing
-- Ensure `cargo clippy` passes without warnings
+- Run `cargo fmt --all -- --check` before committing
+- Ensure `cargo clippy --all-targets --locked -- -D warnings` passes
+- Run `cargo +1.92.0 check --all-targets --locked` when changing compatibility-sensitive code
 - Write tests for new functionality
 - Document public APIs with doc comments
 
@@ -54,7 +55,8 @@ RUST_BACKTRACE=1 cargo run -- encrypt test.txt
 
 ## Security
 
-If you discover a security vulnerability, please **do not** open a public issue. Instead, please email the maintainers directly or use GitHub's private security reporting feature.
+If you discover a security vulnerability, please **do not** open a public
+issue. Follow the private reporting process in [SECURITY.md](SECURITY.md).
 
 ### Security-Related Changes
 

@@ -5,10 +5,9 @@ use chacha20poly1305::{
 };
 use rand::rngs::OsRng;
 use rand::RngCore;
-use zeroize::Zeroizing;
 
 use crate::error::{IronlockError, Result};
-use crate::memlock::mlock_slice;
+use crate::memlock::LockedBytes;
 
 /// Ironlock file format magic bytes - identifies our encrypted files
 pub const MAGIC_BYTES: &[u8; 8] = b"IRONLOCK";
@@ -24,6 +23,9 @@ pub const NONCE_LENGTH: usize = 12;
 
 /// Key length for ChaCha20-Poly1305 (32 bytes = 256 bits)
 pub const KEY_LENGTH: usize = 32;
+
+/// Stable-address, zeroizing key storage with best-effort memory locking.
+pub type LockedKey = LockedBytes<KEY_LENGTH>;
 
 /// Argon2id parameters - tuned for security
 /// These parameters provide strong resistance against GPU/ASIC attacks
@@ -98,13 +100,14 @@ pub fn validate_kdf_params(kdf_params: &KdfParams) -> Result<()> {
 ///
 /// The salt ensures that the same password produces different keys for different files.
 ///
-/// The derived key is memory-locked (best-effort) to prevent it from being swapped to disk.
-/// Callers should be aware that the returned key occupies mlocked memory.
+/// The derived key is written directly into stable heap storage that is
+/// memory-locked on a best-effort basis. It is zeroized before being unlocked
+/// and deallocated when the returned guard is dropped.
 pub fn derive_key_from_password(
     password: &[u8],
     salt: &[u8],
     kdf_params: &KdfParams,
-) -> Result<Zeroizing<[u8; KEY_LENGTH]>> {
+) -> Result<LockedKey> {
     validate_kdf_params(kdf_params)?;
 
     let params = Params::new(
@@ -117,14 +120,12 @@ pub fn derive_key_from_password(
 
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
-    let mut key = Zeroizing::new([0u8; KEY_LENGTH]);
+    // Allocate and attempt to lock the final storage before Argon2 writes the
+    // derived key. Moving LockedKey never moves this boxed allocation.
+    let mut key = LockedKey::zeroed();
     argon2
-        .hash_password_into(password, salt, key.as_mut())
+        .hash_password_into(password, salt, key.as_mut_bytes())
         .map_err(|e| IronlockError::EncryptionFailed(format!("Key derivation failed: {}", e)))?;
-
-    // Best-effort mlock to prevent the key from being swapped to disk.
-    // Failures are silently ignored (e.g., due to RLIMIT_MEMLOCK).
-    mlock_slice(key.as_ref());
 
     Ok(key)
 }
@@ -380,6 +381,31 @@ pub fn decrypt_file(password: &[u8], encrypted_data: &[u8]) -> Result<(String, V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_kdf() -> KdfParams {
+        KdfParams {
+            memory_kib: MIN_ARGON2_MEMORY_KIB,
+            iterations: MIN_ARGON2_ITERATIONS,
+            parallelism: MIN_ARGON2_PARALLELISM,
+        }
+    }
+
+    fn decode_hex(input: &str) -> Vec<u8> {
+        assert_eq!(input.len() % 2, 0);
+        input
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let digit = |byte: u8| match byte {
+                    b'0'..=b'9' => byte - b'0',
+                    b'a'..=b'f' => byte - b'a' + 10,
+                    b'A'..=b'F' => byte - b'A' + 10,
+                    _ => panic!("invalid hexadecimal test fixture"),
+                };
+                (digit(pair[0]) << 4) | digit(pair[1])
+            })
+            .collect()
+    }
 
     // ==================== Key Derivation Tests ====================
 
@@ -1195,5 +1221,349 @@ mod tests {
             matches!(result, Err(IronlockError::InvalidFileFormat)),
             "Tampered magic bytes should be rejected"
         );
+    }
+
+    #[test]
+    fn test_current_kdf_profile_is_stable_and_valid() {
+        assert_eq!(
+            KdfParams::current(),
+            KdfParams {
+                memory_kib: 65_536,
+                iterations: 3,
+                parallelism: 4,
+            }
+        );
+        validate_kdf_params(&KdfParams::current()).unwrap();
+    }
+
+    #[test]
+    fn test_kdf_parameter_boundaries_are_accepted() {
+        let accepted = [
+            test_kdf(),
+            KdfParams {
+                memory_kib: MIN_ARGON2_PARALLELISM * 8,
+                iterations: MAX_ARGON2_ITERATIONS,
+                parallelism: MIN_ARGON2_PARALLELISM,
+            },
+            KdfParams {
+                memory_kib: MAX_ARGON2_PARALLELISM * 8,
+                iterations: MIN_ARGON2_ITERATIONS,
+                parallelism: MAX_ARGON2_PARALLELISM,
+            },
+            KdfParams {
+                memory_kib: MAX_ARGON2_MEMORY_KIB,
+                iterations: MAX_ARGON2_ITERATIONS,
+                parallelism: MAX_ARGON2_PARALLELISM,
+            },
+        ];
+        for params in accepted {
+            validate_kdf_params(&params)
+                .unwrap_or_else(|error| panic!("valid boundary {params:?} was rejected: {error}"));
+        }
+    }
+
+    #[test]
+    fn test_kdf_resource_limit_matrix() {
+        let invalid = [
+            KdfParams {
+                memory_kib: MIN_ARGON2_MEMORY_KIB - 1,
+                ..test_kdf()
+            },
+            KdfParams {
+                memory_kib: MAX_ARGON2_MEMORY_KIB + 1,
+                ..test_kdf()
+            },
+            KdfParams {
+                iterations: MIN_ARGON2_ITERATIONS - 1,
+                ..test_kdf()
+            },
+            KdfParams {
+                iterations: MAX_ARGON2_ITERATIONS + 1,
+                ..test_kdf()
+            },
+            KdfParams {
+                parallelism: MIN_ARGON2_PARALLELISM - 1,
+                ..test_kdf()
+            },
+            KdfParams {
+                parallelism: MAX_ARGON2_PARALLELISM + 1,
+                ..test_kdf()
+            },
+        ];
+        for params in invalid {
+            assert!(
+                matches!(
+                    validate_kdf_params(&params),
+                    Err(IronlockError::ResourceLimit(_))
+                ),
+                "misclassified {params:?}"
+            );
+            assert!(matches!(
+                derive_key_from_password(b"password", b"0123456789abcdef", &params),
+                Err(IronlockError::ResourceLimit(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn test_kdf_rejects_insufficient_memory_for_lanes() {
+        let params = KdfParams {
+            memory_kib: 63,
+            iterations: 1,
+            parallelism: 8,
+        };
+        assert!(matches!(
+            validate_kdf_params(&params),
+            Err(IronlockError::InvalidFileFormat)
+        ));
+        assert!(matches!(
+            derive_key_from_password(b"password", b"0123456789abcdef", &params),
+            Err(IronlockError::InvalidFileFormat)
+        ));
+
+        validate_kdf_params(&KdfParams {
+            memory_kib: 64,
+            ..params
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_argon2_salt_length_boundary() {
+        assert!(matches!(
+            derive_key_from_password(b"password", &[0u8; 7], &test_kdf()),
+            Err(IronlockError::EncryptionFailed(_))
+        ));
+        assert!(derive_key_from_password(b"password", &[0u8; 8], &test_kdf()).is_ok());
+    }
+
+    #[test]
+    fn test_argon2id_known_answer() {
+        let key = derive_key_from_password(b"password", b"0123456789abcdef", &test_kdf()).unwrap();
+        let expected: [u8; KEY_LENGTH] =
+            decode_hex("771338d819573c67116b39e1788ae8e04b0eb0cf9dfbbfe2e6d746cf3e464fc7")
+                .try_into()
+                .unwrap();
+        assert_eq!(*key, expected);
+    }
+
+    #[test]
+    fn test_derived_key_keeps_stable_address_when_guard_moves() {
+        let key = derive_key_from_password(b"password", b"0123456789abcdef", &test_kdf()).unwrap();
+        let pointer = key.as_ptr();
+        let expected = *key;
+
+        let moved = key;
+
+        assert_eq!(moved.as_ptr(), pointer);
+        assert_eq!(*moved, expected);
+    }
+
+    #[test]
+    fn test_chacha20_poly1305_rfc_8439_vector() {
+        let key: [u8; KEY_LENGTH] =
+            decode_hex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+                .try_into()
+                .unwrap();
+        let nonce: [u8; NONCE_LENGTH] = decode_hex("070000004041424344454647").try_into().unwrap();
+        let aad = decode_hex("50515253c0c1c2c3c4c5c6c7");
+        let plaintext = decode_hex(concat!(
+            "4c616469657320616e642047656e746c",
+            "656d656e206f662074686520636c6173",
+            "73206f66202739393a20496620492063",
+            "6f756c64206f6666657220796f75206f",
+            "6e6c79206f6e652074697020666f7220",
+            "746865206675747572652c2073756e73",
+            "637265656e20776f756c642062652069",
+            "742e"
+        ));
+        let expected = decode_hex(concat!(
+            "d31a8d34648e60db7b86afbc53ef7ec2",
+            "a4aded51296e08fea9e2b5a736ee62d6",
+            "3dbea45e8ca9671282fafb69da92728b",
+            "1a71de0a9e060b2905d6a5b67ecd3b36",
+            "92ddbd7f2d778b8c9803aee328091b58",
+            "fab324e4fad675945585808b4831d7bc",
+            "3ff4def08e4b7a9de576d26586cec64b",
+            "61161ae10b594f09e26a7e902ecbd0600691"
+        ));
+
+        let ciphertext = encrypt(&key, &nonce, &plaintext, &aad).unwrap();
+        assert_eq!(ciphertext, expected);
+        assert_eq!(decrypt(&key, &nonce, &expected, &aad).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn test_decrypt_rejects_every_length_below_auth_tag() {
+        let key = [0x11; KEY_LENGTH];
+        let nonce = [0x22; NONCE_LENGTH];
+        for length in 0..16 {
+            assert!(matches!(
+                decrypt(&key, &nonce, &vec![0; length], b"aad"),
+                Err(IronlockError::DecryptionFailed)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_every_ciphertext_and_tag_byte_is_authenticated() {
+        let key = [0x31; KEY_LENGTH];
+        let nonce = [0x72; NONCE_LENGTH];
+        let aad = b"authenticated context";
+        let ciphertext = encrypt(&key, &nonce, b"secret payload", aad).unwrap();
+        for index in 0..ciphertext.len() {
+            let mut mutated = ciphertext.clone();
+            mutated[index] ^= 1;
+            assert!(matches!(
+                decrypt(&key, &nonce, &mutated, aad),
+                Err(IronlockError::DecryptionFailed)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_every_aad_byte_is_authenticated() {
+        let key = [0x31; KEY_LENGTH];
+        let nonce = [0x72; NONCE_LENGTH];
+        let aad = b"authenticated context";
+        let ciphertext = encrypt(&key, &nonce, b"secret payload", aad).unwrap();
+        for index in 0..aad.len() {
+            let mut mutated_aad = aad.to_vec();
+            mutated_aad[index] ^= 1;
+            assert!(matches!(
+                decrypt(&key, &nonce, &ciphertext, &mutated_aad),
+                Err(IronlockError::DecryptionFailed)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_v1_minimum_kdf_roundtrip_and_exact_size() {
+        let filename = "x";
+        let plaintext = b"";
+        let encrypted =
+            create_encrypted_file_with_params(b"password", filename, plaintext, &test_kdf())
+                .unwrap();
+        assert_eq!(encrypted.len(), 8 + 1 + 12 + 2 + 1 + 16 + 12 + 16);
+        assert_eq!(
+            decrypt_file(b"password", &encrypted).unwrap(),
+            (filename.to_string(), plaintext.to_vec())
+        );
+    }
+
+    #[test]
+    fn test_v1_critical_truncation_matrix() {
+        let filename = "file.bin";
+        let encrypted =
+            create_encrypted_file_with_params(b"password", filename, b"payload", &test_kdf())
+                .unwrap();
+        let ciphertext_start = 23 + filename.len() + SALT_LENGTH + NONCE_LENGTH;
+        let lengths = [
+            0,
+            7,
+            8,
+            9,
+            20,
+            22,
+            23,
+            ciphertext_start - 1,
+            ciphertext_start,
+            ciphertext_start + 15,
+            encrypted.len() - 1,
+        ];
+        for length in lengths {
+            assert!(
+                decrypt_file(b"password", &encrypted[..length]).is_err(),
+                "accepted prefix length {length}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_v1_hostile_header_and_body_mutation_matrix() {
+        let filename = "file.bin";
+        let encrypted =
+            create_encrypted_file_with_params(b"password", filename, b"payload", &test_kdf())
+                .unwrap();
+        let salt_start = 23 + filename.len();
+        let nonce_start = salt_start + SALT_LENGTH;
+        let ciphertext_start = nonce_start + NONCE_LENGTH;
+
+        let mut mutations = Vec::new();
+        for index in [
+            0,
+            7,
+            8,
+            12,
+            16,
+            20,
+            21,
+            22,
+            23,
+            salt_start,
+            nonce_start,
+            ciphertext_start,
+        ] {
+            let mut mutated = encrypted.clone();
+            mutated[index] ^= 1;
+            mutations.push(mutated);
+        }
+        let mut tampered_tag = encrypted.clone();
+        *tampered_tag.last_mut().unwrap() ^= 1;
+        mutations.push(tampered_tag);
+        let mut appended = encrypted;
+        appended.push(0);
+        mutations.push(appended);
+
+        for (index, mutated) in mutations.into_iter().enumerate() {
+            assert!(
+                decrypt_file(b"password", &mutated).is_err(),
+                "accepted mutation {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_v1_untrusted_kdf_fields_have_stable_error_classes() {
+        let encrypted =
+            create_encrypted_file_with_params(b"password", "file.bin", b"payload", &test_kdf())
+                .unwrap();
+        for (range, value) in [
+            (9..13, MAX_ARGON2_MEMORY_KIB + 1),
+            (13..17, MAX_ARGON2_ITERATIONS + 1),
+            (17..21, MAX_ARGON2_PARALLELISM + 1),
+        ] {
+            let mut mutated = encrypted.clone();
+            mutated[range].copy_from_slice(&value.to_be_bytes());
+            assert!(matches!(
+                decrypt_file(b"password", &mutated),
+                Err(IronlockError::ResourceLimit(_))
+            ));
+        }
+
+        let mut insufficient_memory = encrypted;
+        insufficient_memory[17..21].copy_from_slice(&2u32.to_be_bytes());
+        assert!(matches!(
+            decrypt_file(b"password", &insufficient_memory),
+            Err(IronlockError::InvalidFileFormat)
+        ));
+    }
+
+    #[test]
+    fn test_v1_filename_length_mutation_matrix_never_panics_or_succeeds() {
+        let encrypted =
+            create_encrypted_file_with_params(b"password", "file.bin", b"payload", &test_kdf())
+                .unwrap();
+        for claimed_length in [0u16, 1, 7, 9, 255, u16::MAX] {
+            if claimed_length == 8 {
+                continue;
+            }
+            let mut mutated = encrypted.clone();
+            mutated[21..23].copy_from_slice(&claimed_length.to_be_bytes());
+            assert!(
+                decrypt_file(b"password", &mutated).is_err(),
+                "accepted filename length {claimed_length}"
+            );
+        }
     }
 }

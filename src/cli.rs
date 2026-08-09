@@ -4,10 +4,11 @@ use std::path::PathBuf;
 /// Ironlock - A secure file encryption tool
 ///
 /// Encrypts files using Argon2id for key derivation and ChaCha20-Poly1305 for
-/// authenticated encryption. Your files are protected with military-grade security.
+/// authenticated encryption.
 #[derive(Parser, Debug)]
 #[command(name = "ironlock")]
 #[command(author, version, about, long_about = None)]
+#[command(arg_required_else_help = true)]
 #[command(propagate_version = true)]
 pub struct Cli {
     #[command(subcommand)]
@@ -18,8 +19,8 @@ pub struct Cli {
 pub enum Commands {
     /// Encrypt one or more files
     ///
-    /// Fields will be encrypted and saved with the .il extension.
-    /// Original files are preserved (not deleted).
+    /// Files will be encrypted and saved with the .il extension.
+    /// Original files are preserved unless --shred is used.
     /// If no files are specified, reads from stdin and writes to stdout.
     #[command(visible_alias = "enc", visible_alias = "e")]
     Encrypt {
@@ -28,16 +29,22 @@ pub enum Commands {
         files: Vec<PathBuf>,
 
         /// Force overwrite without prompting if output file exists
-        #[arg(short, long, default_value_t = false)]
+        #[arg(short, long, default_value_t = false, requires = "files")]
         force: bool,
 
         /// Best-effort overwrite/delete originals after encryption.
         /// This is not guaranteed media sanitization on SSDs, snapshots, or CoW storage.
-        #[arg(short = 's', long, visible_alias = "delete", default_value_t = false)]
+        #[arg(
+            short = 's',
+            long,
+            visible_alias = "delete",
+            default_value_t = false,
+            requires = "files"
+        )]
         shred: bool,
 
-        /// Show a progress bar when processing multiple files
-        #[arg(short, long, default_value_t = false)]
+        /// Show a progress bar while processing files
+        #[arg(short, long, default_value_t = false, requires = "files")]
         progress: bool,
     },
 
@@ -51,16 +58,16 @@ pub enum Commands {
         #[arg(num_args = 0..)]
         files: Vec<PathBuf>,
 
-        /// Output directory for decrypted files (defaults to current directory)
-        #[arg(short, long)]
+        /// Output directory (file inputs default to current directory; directories restore in place)
+        #[arg(short, long, requires = "files")]
         output: Option<PathBuf>,
 
         /// Force overwrite without prompting if output file exists
-        #[arg(short, long, default_value_t = false)]
+        #[arg(short, long, default_value_t = false, requires = "files")]
         force: bool,
 
-        /// Show a progress bar when processing multiple files
-        #[arg(short, long, default_value_t = false)]
+        /// Show a progress bar while processing files
+        #[arg(short, long, default_value_t = false, requires = "files")]
         progress: bool,
     },
 }
@@ -74,6 +81,7 @@ impl Cli {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::error::ErrorKind;
     use clap::CommandFactory;
 
     // ==================== Basic Parsing Tests ====================
@@ -464,5 +472,308 @@ mod tests {
             }
             _ => panic!("Expected Encrypt command"),
         }
+    }
+
+    // ==================== CLI Contract Tests ====================
+
+    #[test]
+    fn missing_command_displays_help() {
+        let error = Cli::try_parse_from(["ironlock"]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+        let rendered = error.to_string();
+        assert!(rendered.contains("Usage:"));
+        assert!(rendered.contains("<COMMAND>"));
+    }
+
+    #[test]
+    fn unknown_command_is_an_invalid_subcommand() {
+        let error = Cli::try_parse_from(["ironlock", "archive"]).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::InvalidSubcommand);
+        assert!(error.to_string().contains("unrecognized subcommand"));
+    }
+
+    #[test]
+    fn top_level_help_lists_commands_and_aliases() {
+        let error = Cli::try_parse_from(["ironlock", "--help"]).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+        let help = error.to_string();
+        assert!(help.contains("encrypt"));
+        assert!(help.contains("enc, e"));
+        assert!(help.contains("decrypt"));
+        assert!(help.contains("dec, d"));
+    }
+
+    #[test]
+    fn version_comes_from_package_metadata() {
+        let error = Cli::try_parse_from(["ironlock", "--version"]).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::DisplayVersion);
+        assert_eq!(
+            error.to_string().trim(),
+            concat!("ironlock ", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn propagated_subcommand_version_uses_canonical_name() {
+        for (command, canonical) in [
+            ("encrypt", "encrypt"),
+            ("enc", "encrypt"),
+            ("e", "encrypt"),
+            ("decrypt", "decrypt"),
+            ("dec", "decrypt"),
+            ("d", "decrypt"),
+        ] {
+            let error = Cli::try_parse_from(["ironlock", command, "--version"]).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::DisplayVersion, "{command}");
+            assert_eq!(
+                error.to_string().trim(),
+                format!("ironlock-{canonical} {}", env!("CARGO_PKG_VERSION")),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn encrypt_help_is_precise_and_documents_safety() {
+        let error = Cli::try_parse_from(["ironlock", "encrypt", "--help"]).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+        let help = error.to_string();
+        assert!(help.contains("Files will be encrypted"));
+        assert!(!help.contains("Fields will be encrypted"));
+        assert!(!help.contains("military-grade"));
+        assert!(help.contains("not guaranteed media sanitization"));
+        assert!(help.contains("--delete"));
+    }
+
+    #[test]
+    fn decrypt_help_documents_output_and_stream_modes() {
+        let error = Cli::try_parse_from(["ironlock", "decrypt", "--help"]).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+        let help = error.to_string();
+        assert!(help.contains("--output"));
+        assert!(help.contains("reads from stdin"));
+        assert!(help.contains("writes to stdout"));
+    }
+
+    #[test]
+    fn encrypt_rejects_file_only_flags_without_files() {
+        for flag in ["--force", "--shred", "--delete", "--progress"] {
+            let error = Cli::try_parse_from(["ironlock", "encrypt", flag]).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument, "{flag}");
+            assert!(error.to_string().contains("[FILES]..."), "{flag}");
+        }
+    }
+
+    #[test]
+    fn decrypt_rejects_file_only_boolean_flags_without_files() {
+        for flag in ["--force", "--progress"] {
+            let error = Cli::try_parse_from(["ironlock", "decrypt", flag]).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument, "{flag}");
+            assert!(error.to_string().contains("[FILES]..."), "{flag}");
+        }
+    }
+
+    #[test]
+    fn decrypt_rejects_output_without_files() {
+        let error = Cli::try_parse_from(["ironlock", "decrypt", "--output", "out"]).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        assert!(error.to_string().contains("[FILES]..."));
+    }
+
+    #[test]
+    fn empty_encrypt_path_is_rejected() {
+        let error = Cli::try_parse_from(["ironlock", "encrypt", ""]).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
+        assert!(error.to_string().contains("value is required"));
+    }
+
+    #[test]
+    fn empty_decrypt_path_is_rejected() {
+        let error = Cli::try_parse_from(["ironlock", "decrypt", ""]).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
+        assert!(error.to_string().contains("value is required"));
+    }
+
+    #[test]
+    fn empty_output_path_is_rejected() {
+        let error =
+            Cli::try_parse_from(["ironlock", "decrypt", "file.il", "--output", ""]).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
+        assert!(error.to_string().contains("value is required"));
+    }
+
+    #[test]
+    fn option_terminator_allows_hyphen_prefixed_encrypt_path() {
+        let cli = Cli::try_parse_from(["ironlock", "encrypt", "--", "--force"]).unwrap();
+
+        match cli.command {
+            Commands::Encrypt { files, force, .. } => {
+                assert_eq!(files, [PathBuf::from("--force")]);
+                assert!(!force);
+            }
+            _ => panic!("Expected Encrypt command"),
+        }
+    }
+
+    #[test]
+    fn option_terminator_allows_hyphen_prefixed_decrypt_path() {
+        let cli = Cli::try_parse_from(["ironlock", "decrypt", "--", "--output"]).unwrap();
+
+        match cli.command {
+            Commands::Decrypt { files, output, .. } => {
+                assert_eq!(files, [PathBuf::from("--output")]);
+                assert!(output.is_none());
+            }
+            _ => panic!("Expected Decrypt command"),
+        }
+    }
+
+    #[test]
+    fn combined_encrypt_short_flags_are_supported() {
+        let cli = Cli::try_parse_from(["ironlock", "encrypt", "-fsp", "file.txt"]).unwrap();
+
+        match cli.command {
+            Commands::Encrypt {
+                files,
+                force,
+                shred,
+                progress,
+            } => {
+                assert_eq!(files, [PathBuf::from("file.txt")]);
+                assert!(force);
+                assert!(shred);
+                assert!(progress);
+            }
+            _ => panic!("Expected Encrypt command"),
+        }
+    }
+
+    #[test]
+    fn combined_decrypt_short_flags_are_supported() {
+        let cli =
+            Cli::try_parse_from(["ironlock", "decrypt", "-fp", "-o", "out", "file.il"]).unwrap();
+
+        match cli.command {
+            Commands::Decrypt {
+                files,
+                output,
+                force,
+                progress,
+            } => {
+                assert_eq!(files, [PathBuf::from("file.il")]);
+                assert_eq!(output, Some(PathBuf::from("out")));
+                assert!(force);
+                assert!(progress);
+            }
+            _ => panic!("Expected Decrypt command"),
+        }
+    }
+
+    #[test]
+    fn output_accepts_equals_syntax() {
+        let cli = Cli::try_parse_from(["ironlock", "decrypt", "--output=out", "file.il"]).unwrap();
+
+        match cli.command {
+            Commands::Decrypt { output, .. } => {
+                assert_eq!(output, Some(PathBuf::from("out")));
+            }
+            _ => panic!("Expected Decrypt command"),
+        }
+    }
+
+    #[test]
+    fn unicode_paths_are_preserved() {
+        let cli = Cli::try_parse_from(["ironlock", "encrypt", "秘密/🔒.txt"]).unwrap();
+
+        match cli.command {
+            Commands::Encrypt { files, .. } => {
+                assert_eq!(files, [PathBuf::from("秘密/🔒.txt")]);
+            }
+            _ => panic!("Expected Encrypt command"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_unicode_windows_paths_are_preserved() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        let path = OsString::from_wide(&[b'f' as u16, 0xD800, b'x' as u16]);
+        let cli = Cli::try_parse_from([
+            OsString::from("ironlock"),
+            OsString::from("encrypt"),
+            path.clone(),
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Encrypt { files, .. } => {
+                assert_eq!(files, [PathBuf::from(path)]);
+            }
+            _ => panic!("Expected Encrypt command"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_unix_paths_are_preserved() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = OsString::from_vec(vec![b'f', 0xFF, b'x']);
+        let cli = Cli::try_parse_from([
+            OsString::from("ironlock"),
+            OsString::from("encrypt"),
+            path.clone(),
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Encrypt { files, .. } => {
+                assert_eq!(files, [PathBuf::from(path)]);
+            }
+            _ => panic!("Expected Encrypt command"),
+        }
+    }
+
+    #[test]
+    fn command_specific_options_are_rejected_elsewhere() {
+        let encrypt_error =
+            Cli::try_parse_from(["ironlock", "encrypt", "--output", "out", "file.txt"])
+                .unwrap_err();
+        assert_eq!(encrypt_error.kind(), ErrorKind::UnknownArgument);
+
+        let decrypt_error =
+            Cli::try_parse_from(["ironlock", "decrypt", "--shred", "file.il"]).unwrap_err();
+        assert_eq!(decrypt_error.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn missing_output_value_is_rejected() {
+        let error =
+            Cli::try_parse_from(["ironlock", "decrypt", "file.il", "--output"]).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn command_names_are_case_sensitive() {
+        let error = Cli::try_parse_from(["ironlock", "Encrypt", "file.txt"]).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::InvalidSubcommand);
     }
 }
